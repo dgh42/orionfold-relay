@@ -4,6 +4,8 @@ import {
   agentApiPath,
   agentPath,
   blueprintApiPath,
+  blueprintPath,
+  decodePathId,
 } from "@/lib/routing/primitive-paths";
 
 /**
@@ -59,6 +61,9 @@ describe("primitive paths", () => {
     expect(blueprintApiPath("finance-pack/monthly-close", "instantiate")).toBe(
       "/api/blueprints/finance-pack%2Fmonthly-close/instantiate"
     );
+    expect(blueprintPath("finance-pack/monthly-close")).toBe(
+      "/blueprints/finance-pack%2Fmonthly-close"
+    );
     expect(
       segmentCount(blueprintApiPath("finance-pack/monthly-close", "start"))
     ).toBe(segmentCount(blueprintApiPath("monthly-close", "start")));
@@ -66,5 +71,25 @@ describe("primitive paths", () => {
 
   it("encodes other characters that would break a segment", () => {
     expect(agentApiPath("a?b#c")).toBe("/api/agents/a%3Fb%23c");
+  });
+});
+
+describe("decodePathId", () => {
+  // A route handler is handed decoded params; a page component is not. So a
+  // page has to undo what the path builders did, and these two must compose.
+  it("reverses what the path builders encode", () => {
+    const built = agentPath(NAMESPACED);
+    expect(decodePathId(built.split("/")[2])).toBe(NAMESPACED);
+    expect(decodePathId("reading-radar%2Freader-coach")).toBe(NAMESPACED);
+  });
+
+  it("leaves an already-plain id alone", () => {
+    expect(decodePathId(PLAIN)).toBe(PLAIN);
+  });
+
+  it("returns a malformed escape unchanged rather than throwing", () => {
+    expect(() => decodePathId("%zz")).not.toThrow();
+    expect(decodePathId("%zz")).toBe("%zz");
+    expect(decodePathId("100%")).toBe("100%");
   });
 });

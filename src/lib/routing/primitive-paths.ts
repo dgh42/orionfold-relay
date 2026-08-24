@@ -36,10 +36,39 @@ export function agentApiPath(profileId: string, ...segments: string[]): string {
   return primitivePath("/api/agents", profileId, segments);
 }
 
+/** A blueprint's page path — `/blueprints/<id>`, plus any trailing segments. */
+export function blueprintPath(
+  blueprintId: string,
+  ...segments: string[]
+): string {
+  return primitivePath("/blueprints", blueprintId, segments);
+}
+
 /** A blueprint's API path — `/api/blueprints/<id>`, plus any trailing segments. */
 export function blueprintApiPath(
   blueprintId: string,
   ...segments: string[]
 ): string {
   return primitivePath("/api/blueprints", blueprintId, segments);
+}
+
+/**
+ * The id carried by a page's route params.
+ *
+ * Route handlers and page components do not agree here. A handler receives
+ * decoded params, so `/api/x/a%2Fb` arrives as `a/b`; a page component receives
+ * the raw segment, so the same id arrives as `a%2Fb` and a lookup by it finds
+ * nothing. Verified against Next 16.2 for `%2F`, `%20` and multi-byte escapes
+ * alike — a page decodes none of them.
+ *
+ * So a page must decode what it is given. A malformed escape is returned as-is
+ * rather than thrown, so a bad URL renders the page's own not-found instead of
+ * failing the request.
+ */
+export function decodePathId(rawId: string): string {
+  try {
+    return decodeURIComponent(rawId);
+  } catch {
+    return rawId;
+  }
 }
