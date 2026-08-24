@@ -15,6 +15,7 @@ import {
   readApprovalResponse,
   runApprovalMutation,
 } from "@/lib/notifications/approval-client";
+import { agentApiPath } from "@/lib/routing/primitive-paths";
 
 interface ContextProposalReviewProps {
   notificationId: string;
@@ -41,7 +42,7 @@ export function ContextProposalReview({
     setErrorMessage(null);
     try {
       const result = await runApprovalMutation(notificationId, async () => {
-        const res = await fetch(`/api/agents/${profileId}/context`, {
+        const res = await fetch(agentApiPath(profileId, "context"), {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({

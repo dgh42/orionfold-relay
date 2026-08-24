@@ -2,6 +2,7 @@ import { notFound } from "next/navigation";
 import { getProfile, isBuiltin } from "@/lib/agents/profiles/registry";
 import { PageShell } from "@/components/shared/page-shell";
 import { ProfileFormView } from "@/components/profiles/profile-form-view";
+import { agentPath } from "@/lib/routing/primitive-paths";
 
 export const dynamic = "force-dynamic";
 
@@ -23,7 +24,7 @@ export default async function EditProfilePage({
 
   return (
     <PageShell
-      backHref={duplicate === "true" ? "/agents" : `/agents/${id}`}
+      backHref={duplicate === "true" ? "/agents" : agentPath(id)}
       backLabel={duplicate === "true" ? "Back to Agents" : "Back to Agent"}
     >
       <ProfileFormView profileId={id} duplicate={duplicate === "true"} />
