@@ -19,7 +19,8 @@ import { agentApiPath } from "@/lib/routing/primitive-paths";
 
 interface ContextProposalReviewProps {
   notificationId: string;
-  profileId: string;
+  /** Null when the notification names no profile — see handleAction. */
+  profileId: string | null;
   proposedAdditions: string;
   onResponded: () => void;
   compact?: boolean;
@@ -38,6 +39,17 @@ export function ContextProposalReview({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   async function handleAction(action: "approve" | "reject") {
+    // Without a profile id the request path has an empty segment, which matches
+    // no route and returns an HTML 404 — a bad URL reported as a server error.
+    // Say what is actually wrong instead.
+    if (!profileId) {
+      const message =
+        "This proposal does not name an agent profile, so it cannot be resolved here. Open it from the agent's own page.";
+      setErrorMessage(message);
+      toast.error(message);
+      return;
+    }
+
     setSubmitting(true);
     setErrorMessage(null);
     try {
