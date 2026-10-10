@@ -123,3 +123,7 @@ CLAUDE.local.md
 /docs/manifest.json
 /docs/.coverage-gaps.json
 /docs/.last-generated
+
+# Python bytecode
+__pycache__/
+*.py[cod]
