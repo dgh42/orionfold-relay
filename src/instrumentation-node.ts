@@ -50,6 +50,24 @@ export async function registerNodeInstrumentation() {
       );
     }
 
+    // On-demand runs a previous process left behind. Nothing in this process is
+    // executing them, so they would otherwise sit `running` forever and hold
+    // concurrency slots no run can use. Must come BEFORE anything that can
+    // start a run (plugins, scheduler, channel poller) so the cap is counted
+    // against reality rather than against ghosts. Scheduled runs are not swept
+    // here — they carry a lease and `reapExpiredLeases` owns them.
+    try {
+      const { sweepOrphanedTaskRuns } = await import("@/lib/agents/task-slots");
+      const orphaned = sweepOrphanedTaskRuns();
+      if (orphaned.length > 0) {
+        console.warn(
+          `[task-slots] failed ${orphaned.length} on-demand run(s) orphaned by a previous process: ${orphaned.join(", ")}`,
+        );
+      }
+    } catch (err) {
+      console.error("[task-slots] orphan sweep failed:", err);
+    }
+
     // Plugin loader (Kind 5 only). Seeds dogfood examples on first boot,
     // scans ~/.relay/plugins/, registers profiles + blueprints + tables + schedules.
     // Failures are isolated per-plugin; boot continues regardless.
