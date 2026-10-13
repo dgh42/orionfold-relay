@@ -44,6 +44,27 @@ when a run settles, and by a timer that exists only while something is waiting.
 A caller that awaits the run, including a workflow step, waits longer rather
 than erroring.
 
+**The line is in the table, and survives a restart.** A deferred run is
+`status = 'queued' AND run_requested_at IS NOT NULL`; `queued` with no marker is
+a task sitting at rest, which nothing may start. The marker is written by the
+statement that parks the row, cleared by the statement that claims it, and
+cleared by a cancel or by a status written through `PATCH /api/tasks/:id`.
+`run_requested_mode` records `start` or `resume` beside it. The drain orders by
+`run_requested_at`, at millisecond resolution, so submission order is what
+decides who goes next — not the order dispatchers happened to arrive in. An
+in-memory map holds the promise each waiting dispatcher is parked on, which is
+the one thing a table cannot record.
+
+**Every deferred run is accounted for at boot.** `recoverDeferredTaskRuns()`
+runs after the orphan sweep and after the plugin loader. Workflow steps are
+failed with `failure_reason = 'process_restart'`, because their workflow engine
+died with the process and nothing at boot resurrects a workflow run. Every other
+deferred run is re-dispatched through the normal cap, oldest submission first,
+as a start or a resume per its recorded mode. A marker found on a row that is
+not a deferred run is dropped. Nothing is left `queued` and silently dead — which
+is what used to happen, and is what the caller's `202 queued` had already
+promised would not.
+
 **The routes say so.** `POST /api/tasks/:id/execute` and
 `POST /api/tasks/:id/resume` answer `202` either way, with `state: "running"` or
 `state: "queued"` and the cap that applied. `?force=true` on execute bypasses the
@@ -61,9 +82,11 @@ created through the API and the chat `create_task` tool are stamped `manual`. A
 
 ## Design decisions
 
-The full record, including the deadlock analysis of every awaiting start path and
-why the waiting line is held in memory rather than in the `tasks` table, is
-`.agents/skills/architect/references/tdr-on-demand-run-cap.md`.
+The full record is
+`.agents/skills/architect/references/tdr-on-demand-run-cap.md`: the deadlock
+analysis of every awaiting start path, why the waiting line moved out of memory
+and into `tasks` (it was held in memory at first, and a restart dropped it
+silently), and the two residual windows that move left open.
 
 ## Implementation
 
@@ -75,7 +98,11 @@ why the waiting line is held in memory rather than in the `tasks` table, is
 | Shared config reader | `src/lib/schedules/config.ts` |
 | Routes | `src/app/api/tasks/[id]/execute/route.ts`, `src/app/api/tasks/[id]/resume/route.ts` |
 | Workflow step provenance and claim | `src/lib/workflows/engine.ts` |
-| Startup sweep wiring | `src/instrumentation-node.ts` |
+| Boot recovery of the deferred line | `src/lib/agents/deferred-run-recovery.ts` |
+| The two marker columns | `src/lib/db/schema.ts`, `src/lib/db/bootstrap.ts` |
+| Marker cleared on cancel | `src/lib/agents/runtime/index.ts` |
+| Marker cleared on a status edit | `src/app/api/tasks/[id]/route.ts` |
+| Startup sweep and recovery wiring | `src/instrumentation-node.ts` |
 
 ## Tests
 
@@ -86,7 +113,27 @@ why the waiting line is held in memory rather than in the `tasks` table, is
   two real SQLite connections racing beneath cap 1, the two caps' independence,
   FIFO ordering across three deferred runs, a cancelled waiter dropped rather
   than started, 12 runs submitted at once never exceeding a cap of 3, `force`,
-  and the startup sweep touching only orphaned on-demand runs.
+  and the startup sweep touching only orphaned on-demand runs. Then the
+  persisted line: a deferred row carries the marker and a resting one does not,
+  the mode is recorded, a second park keeps the first submission's instant, the
+  claim clears the marker, a resting `queued` row is never drained, the drain
+  follows the marker even when dispatchers arrive out of order, and
+  `clearStaleRunRequests` / `failDeferredWorkflowRuns` touch only what they
+  should.
+- `src/lib/agents/__tests__/deferred-run-recovery.test.ts` — the restart,
+  simulated: deferred rows left by a process that is gone and an empty in-memory
+  line. Re-dispatch oldest first, a resume re-dispatched as a resume, a workflow
+  step failed with `process_restart` instead, a resting `queued` row untouched,
+  a stale marker dropped, every deferred row accounted for, and one dispatch
+  throwing without stranding the rest.
+- `src/app/api/tasks/[id]/__tests__/run-request-marker.test.ts` — a PATCH that
+  changes the status takes the row out of the line, one that does not leaves it
+  alone, and a delete takes it out with the row.
+- `src/app/api/tasks/[id]/cancel/__tests__/route.test.ts` — a cancel on a
+  deferred run clears its marker.
+- `src/lib/db/__tests__/tasks-run-request.test.ts` — the two columns exist,
+  round-trip at millisecond resolution, and are NULL on a row nobody submitted
+  a run for.
 - `src/lib/agents/__tests__/task-dispatch.test.ts` — the dispatcher gate holds an
   on-demand run and starts it when a slot frees, and does not gate a firing.
 - `src/lib/workflows/__tests__/child-task-concurrency.test.ts` — three parallel

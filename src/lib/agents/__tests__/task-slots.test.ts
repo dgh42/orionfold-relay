@@ -17,10 +17,15 @@ import {
   __resetTaskSlotsForTests,
   acquireTaskSlot,
   claimTaskSlot,
+  clearRunRequest,
+  clearStaleRunRequests,
+  countDeferredTaskRuns,
   countRunningTaskSlots,
   countWaitingTaskSlots,
+  failDeferredWorkflowRuns,
   getTaskMaxConcurrent,
   isOnDemandSourceType,
+  listDeferredTaskRuns,
   releaseTaskSlot,
   sweepOrphanedTaskRuns,
 } from "../task-slots";
@@ -49,6 +54,26 @@ function seedTask(
 
 function statusOf(id: string): string | undefined {
   return db.select().from(tasks).where(eq(tasks.id, id)).get()?.status;
+}
+
+function rowOf(id: string) {
+  return db.select().from(tasks).where(eq(tasks.id, id)).get();
+}
+
+/** Put a row in the waiting line by hand, with an exact submission instant. */
+function markDeferred(
+  id: string,
+  requestedAtMs: number,
+  mode: "start" | "resume" = "start",
+) {
+  db.update(tasks)
+    .set({
+      status: "queued",
+      runRequestedAt: new Date(requestedAtMs),
+      runRequestedMode: mode,
+    })
+    .where(eq(tasks.id, id))
+    .run();
 }
 
 function settle(id: string, status: "completed" | "cancelled" = "completed") {
@@ -441,5 +466,215 @@ describe("sweepOrphanedTaskRuns", () => {
     seedTask({ sourceType: "manual", status: "running" });
     expect(sweepOrphanedTaskRuns()).toHaveLength(1);
     expect(sweepOrphanedTaskRuns()).toHaveLength(0);
+  });
+});
+
+describe("the persisted waiting line", () => {
+  it("marks a deferred run so it is not a resting queued row", async () => {
+    vi.stubEnv("TASK_MAX_CONCURRENT", "1");
+    const running = seedTask({ sourceType: "manual" });
+    claimTaskSlot(running);
+
+    const resting = seedTask({ sourceType: "manual" });
+    const deferred = seedTask({ sourceType: "manual" });
+    const waiter = acquireTaskSlot(deferred);
+    await Promise.resolve();
+
+    // Both rows read `queued`; only the deferred one carries the marker.
+    expect(statusOf(resting)).toBe("queued");
+    expect(statusOf(deferred)).toBe("queued");
+    expect(rowOf(resting)?.runRequestedAt).toBeNull();
+    expect(rowOf(resting)?.runRequestedMode).toBeNull();
+    expect(rowOf(deferred)?.runRequestedAt).toBeInstanceOf(Date);
+    expect(rowOf(deferred)?.runRequestedMode).toBe("start");
+    expect(listDeferredTaskRuns().map((run) => run.id)).toEqual([deferred]);
+    expect(countDeferredTaskRuns()).toBe(1);
+
+    settle(running);
+    expect(await waiter).toBe("claimed");
+  });
+
+  it("records the mode the dispatcher asked for", async () => {
+    vi.stubEnv("TASK_MAX_CONCURRENT", "1");
+    const running = seedTask({ sourceType: "manual" });
+    claimTaskSlot(running);
+
+    const resumed = seedTask({ sourceType: "manual", status: "failed" });
+    const waiter = acquireTaskSlot(resumed, "resume");
+    await Promise.resolve();
+
+    expect(rowOf(resumed)?.runRequestedMode).toBe("resume");
+    expect(listDeferredTaskRuns()).toEqual([
+      { id: resumed, sourceType: "manual", mode: "resume" },
+    ]);
+
+    settle(running);
+    expect(await waiter).toBe("claimed");
+  });
+
+  it("keeps the first submission instant when a run is parked twice", async () => {
+    vi.stubEnv("TASK_MAX_CONCURRENT", "1");
+    const running = seedTask({ sourceType: "manual" });
+    claimTaskSlot(running);
+
+    const deferred = seedTask({ sourceType: "manual" });
+    markDeferred(deferred, 1_000);
+    const waiter = acquireTaskSlot(deferred);
+    await Promise.resolve();
+
+    expect(rowOf(deferred)?.runRequestedAt?.getTime()).toBe(1_000);
+
+    settle(running);
+    expect(await waiter).toBe("claimed");
+  });
+
+  it("clears the marker in the same statement that claims the slot", async () => {
+    const id = seedTask({ sourceType: "manual" });
+    markDeferred(id, 1_000);
+
+    expect(claimTaskSlot(id, { from: ["queued"] })).toBe(true);
+    expect(rowOf(id)?.runRequestedAt).toBeNull();
+    expect(rowOf(id)?.runRequestedMode).toBeNull();
+    expect(countDeferredTaskRuns()).toBe(0);
+  });
+
+  it("never drains a resting queued row that carries no marker", async () => {
+    vi.stubEnv("TASK_MAX_CONCURRENT", "1");
+    const running = seedTask({ sourceType: "manual" });
+    claimTaskSlot(running);
+
+    const resting = seedTask({ sourceType: "manual" });
+    const deferred = seedTask({ sourceType: "manual" });
+    const waiter = acquireTaskSlot(deferred);
+    await Promise.resolve();
+
+    settle(running);
+    expect(await waiter).toBe("claimed");
+
+    // The resting row was never in the line and nothing started it.
+    expect(statusOf(resting)).toBe("queued");
+    expect(rowOf(resting)?.slotClaimedAt).toBeNull();
+  });
+
+  it("drains in marker order even when dispatchers arrive out of order", async () => {
+    vi.stubEnv("TASK_MAX_CONCURRENT", "1");
+    const running = seedTask({ sourceType: "manual" });
+    claimTaskSlot(running);
+
+    // Submitted first, dispatched last — the restart case in miniature.
+    const oldest = seedTask({ sourceType: "manual" });
+    const newest = seedTask({ sourceType: "manual" });
+    markDeferred(oldest, 1_000);
+    markDeferred(newest, 2_000);
+
+    const newestWaiter = acquireTaskSlot(newest);
+    const oldestWaiter = acquireTaskSlot(oldest);
+    await Promise.resolve();
+    expect(countWaitingTaskSlots()).toBe(2);
+
+    settle(running);
+    expect(await oldestWaiter).toBe("claimed");
+    expect(statusOf(oldest)).toBe("running");
+    expect(statusOf(newest)).toBe("queued");
+
+    settle(oldest);
+    expect(await newestWaiter).toBe("claimed");
+  });
+
+  it("clearRunRequest takes a run out of the line without touching its status", () => {
+    const id = seedTask({ sourceType: "manual" });
+    markDeferred(id, 1_000);
+
+    clearRunRequest(id);
+
+    expect(statusOf(id)).toBe("queued");
+    expect(rowOf(id)?.runRequestedAt).toBeNull();
+    expect(listDeferredTaskRuns()).toEqual([]);
+  });
+
+  it("drops a waiter whose marker was cleared under it", async () => {
+    vi.stubEnv("TASK_MAX_CONCURRENT", "1");
+    const running = seedTask({ sourceType: "manual" });
+    claimTaskSlot(running);
+
+    const deferred = seedTask({ sourceType: "manual" });
+    const waiter = acquireTaskSlot(deferred);
+    await Promise.resolve();
+
+    clearRunRequest(deferred);
+    settle(running);
+
+    expect(await waiter).toBe("abandoned");
+    expect(statusOf(deferred)).toBe("queued");
+  });
+});
+
+describe("clearStaleRunRequests", () => {
+  it("drops a marker left on a row that is not a deferred run", () => {
+    const deferred = seedTask({ sourceType: "manual" });
+    markDeferred(deferred, 1_000);
+
+    const cancelled = seedTask({ sourceType: "manual" });
+    markDeferred(cancelled, 1_000);
+    db.update(tasks)
+      .set({ status: "cancelled" })
+      .where(eq(tasks.id, cancelled))
+      .run();
+
+    const scheduled = seedTask({ sourceType: "scheduled" });
+    markDeferred(scheduled, 1_000);
+
+    expect(clearStaleRunRequests().sort()).toEqual([cancelled, scheduled].sort());
+    expect(rowOf(cancelled)?.runRequestedAt).toBeNull();
+    expect(rowOf(scheduled)?.runRequestedAt).toBeNull();
+    expect(rowOf(deferred)?.runRequestedAt).not.toBeNull();
+  });
+
+  it("is idempotent", () => {
+    const id = seedTask({ sourceType: "manual", status: "completed" });
+    markDeferred(id, 1_000);
+    db.update(tasks).set({ status: "completed" }).where(eq(tasks.id, id)).run();
+
+    expect(clearStaleRunRequests()).toEqual([id]);
+    expect(clearStaleRunRequests()).toEqual([]);
+  });
+});
+
+describe("failDeferredWorkflowRuns", () => {
+  it("fails only deferred workflow steps and clears their marker", () => {
+    const step = seedTask({ sourceType: "workflow" });
+    const manual = seedTask({ sourceType: "manual" });
+    const restingStep = seedTask({ sourceType: "workflow" });
+    markDeferred(step, 1_000);
+    markDeferred(manual, 1_000);
+
+    expect(failDeferredWorkflowRuns()).toEqual([step]);
+
+    const failed = rowOf(step);
+    expect(failed?.status).toBe("failed");
+    expect(failed?.failureReason).toBe("process_restart");
+    expect(failed?.result).toContain("waiting for a run slot");
+    expect(failed?.runRequestedAt).toBeNull();
+    expect(failed?.runRequestedMode).toBeNull();
+
+    expect(statusOf(manual)).toBe("queued");
+    expect(statusOf(restingStep)).toBe("queued");
+    expect(rowOf(restingStep)?.failureReason).toBeNull();
+  });
+
+  it("keeps a result the runtime had already written", () => {
+    const step = seedTask({ sourceType: "workflow", result: "partial output" });
+    markDeferred(step, 1_000);
+
+    failDeferredWorkflowRuns();
+
+    expect(rowOf(step)?.result).toBe("partial output");
+  });
+
+  it("is idempotent", () => {
+    const step = seedTask({ sourceType: "workflow" });
+    markDeferred(step, 1_000);
+    expect(failDeferredWorkflowRuns()).toHaveLength(1);
+    expect(failDeferredWorkflowRuns()).toHaveLength(0);
   });
 });

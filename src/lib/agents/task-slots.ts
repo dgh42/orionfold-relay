@@ -7,15 +7,20 @@
  * own claim in `@/lib/schedules/slot-claim`; the two counts are disjoint and
  * together cover every running task, so neither can starve the other.
  *
- * Three pieces:
+ * Four pieces:
  *   - an atomic single-statement claim (never check-then-act — see
  *     `tdr-atomic-slot-claim.md`),
- *   - a FIFO waiting line for runs the cap deferred, drained when a slot frees
- *     and by a low-frequency timer that only exists while something is waiting,
- *   - a startup sweep for runs a previous process left behind as `running`.
+ *   - a FIFO waiting line for runs the cap deferred, held in `tasks` as
+ *     `status = 'queued' AND run_requested_at IS NOT NULL`, drained when a
+ *     slot frees and by a low-frequency timer that only exists while
+ *     something is waiting,
+ *   - a startup sweep for runs a previous process left behind as `running`,
+ *   - a startup recovery for runs it left behind in the waiting line
+ *     (`@/lib/agents/deferred-run-recovery`).
  *
- * An over-cap run is never failed: its row stays `queued` and it starts when
- * its turn comes. Callers that await the run simply wait longer.
+ * An over-cap run is never failed: its row stays `queued`, carries the marker
+ * that says a run was actually submitted for it, and starts when its turn
+ * comes. Callers that await the run simply wait longer.
  */
 
 import { sqlite } from "@/lib/db";
@@ -42,6 +47,9 @@ const CLAIMABLE_STATUSES = ["queued", "planned", "failed", "cancelled"] as const
 
 type ClaimableStatus = (typeof CLAIMABLE_STATUSES)[number];
 
+/** Which dispatcher entry point a deferred run came through. */
+export type RunRequestMode = "start" | "resume";
+
 /**
  * The on-demand half of the running-task count, expressed the same way in the
  * claim and in the counter so the two can never disagree.
@@ -49,6 +57,9 @@ type ClaimableStatus = (typeof CLAIMABLE_STATUSES)[number];
 const ON_DEMAND_PREDICATE = `(source_type IS NULL OR source_type NOT IN ('${SCHEDULED_SOURCE_TYPES.join(
   "', '",
 )}'))`;
+
+/** The persisted waiting line: a run that was submitted and deferred. */
+const DEFERRED_PREDICATE = `status = 'queued' AND run_requested_at IS NOT NULL AND ${ON_DEMAND_PREDICATE}`;
 
 /**
  * Atomic on-demand slot claim.
@@ -59,6 +70,11 @@ const ON_DEMAND_PREDICATE = `(source_type IS NULL OR source_type NOT IN ('${SCHE
  * WHERE clause makes SQLite evaluate the count under the same write lock as
  * the update.
  *
+ * It also clears the waiting-line marker, in the same statement rather than a
+ * second one: a row that is `running` was started, so leaving the marker would
+ * both lie about the line and make the row look deferred again if anything
+ * ever put it back to `queued`.
+ *
  * Deliberately writes no lease. An on-demand run has no bounded duration to
  * check against, so a lease could only ever kill a long legitimate run; the
  * orphan case is handled once at startup instead (`sweepOrphanedTaskRuns`).
@@ -67,7 +83,7 @@ const ON_DEMAND_PREDICATE = `(source_type IS NULL OR source_type NOT IN ('${SCHE
  * prepared once; a caller wanting fewer repeats one of them.
  */
 export const TASK_SLOT_CLAIM_SQL =
-  `UPDATE tasks SET status = 'running', slot_claimed_at = ?, updated_at = ? WHERE id = ? AND status IN (?, ?, ?, ?) AND ${ON_DEMAND_PREDICATE} AND (SELECT COUNT(*) FROM tasks WHERE status = 'running' AND ${ON_DEMAND_PREDICATE}) < ?`;
+  `UPDATE tasks SET status = 'running', slot_claimed_at = ?, run_requested_at = NULL, run_requested_mode = NULL, updated_at = ? WHERE id = ? AND status IN (?, ?, ?, ?) AND ${ON_DEMAND_PREDICATE} AND (SELECT COUNT(*) FROM tasks WHERE status = 'running' AND ${ON_DEMAND_PREDICATE}) < ?`;
 
 const claimStmt = sqlite.prepare(TASK_SLOT_CLAIM_SQL);
 
@@ -79,12 +95,44 @@ const readStatusStmt = sqlite.prepare(
   "SELECT status FROM tasks WHERE id = ?",
 );
 
-const parkStmt = sqlite.prepare(
-  "UPDATE tasks SET status = 'queued', updated_at = ? WHERE id = ? AND status = ?",
+/**
+ * Park a deferred run as `queued` and record that a run was submitted for it.
+ *
+ * One statement for both halves, so a row can never be parked without its
+ * marker — a `queued` row with no marker is a task at rest and nothing may
+ * start it. `COALESCE` keeps the first submission's instant across a second
+ * call for the same run (a boot-recovered dispatch re-enters here), which is
+ * what keeps FIFO by submission order rather than by last touch.
+ *
+ * Guarded on the status the caller observed, so a row that changed underneath
+ * is left alone and its waiter is dropped by the next drain.
+ */
+const markStmt = sqlite.prepare(
+  "UPDATE tasks SET status = 'queued', run_requested_at = COALESCE(run_requested_at, ?), run_requested_mode = ?, updated_at = ? WHERE id = ? AND status = ?",
+);
+
+const clearMarkStmt = sqlite.prepare(
+  "UPDATE tasks SET run_requested_at = NULL, run_requested_mode = NULL WHERE id = ? AND run_requested_at IS NOT NULL",
+);
+
+const listDeferredStmt = sqlite.prepare(
+  `SELECT id, source_type AS sourceType, run_requested_mode AS mode FROM tasks WHERE ${DEFERRED_PREDICATE} ORDER BY run_requested_at, rowid`,
+);
+
+const countDeferredStmt = sqlite.prepare(
+  `SELECT COUNT(*) AS n FROM tasks WHERE ${DEFERRED_PREDICATE}`,
 );
 
 const sweepStmt = sqlite.prepare(
   `UPDATE tasks SET status = 'failed', failure_reason = 'process_restart', result = COALESCE(result, ?), updated_at = ? WHERE status = 'running' AND ${ON_DEMAND_PREDICATE} RETURNING id`,
+);
+
+const failDeferredWorkflowStmt = sqlite.prepare(
+  `UPDATE tasks SET status = 'failed', failure_reason = 'process_restart', result = COALESCE(result, ?), run_requested_at = NULL, run_requested_mode = NULL, updated_at = ? WHERE ${DEFERRED_PREDICATE} AND source_type = 'workflow' RETURNING id`,
+);
+
+const clearStaleMarksStmt = sqlite.prepare(
+  `UPDATE tasks SET run_requested_at = NULL, run_requested_mode = NULL WHERE run_requested_at IS NOT NULL AND NOT (${DEFERRED_PREDICATE}) RETURNING id`,
 );
 
 /** True for every task run the on-demand cap governs. */
@@ -169,37 +217,65 @@ export function claimTaskSlot(
   return result.changes === 1;
 }
 
-interface Waiter {
-  taskId: string;
-  resolve: (claimed: boolean) => void;
+/**
+ * Forget that a run was submitted for this task.
+ *
+ * Called wherever a task leaves the waiting line by a route other than a claim
+ * — a cancel, a status written through the PATCH route. Not clearing would
+ * leave a marker on a row that nothing is waiting on, and a later edit putting
+ * that row back to `queued` would make it look like a run somebody submitted.
+ *
+ * Deliberately does not touch `updated_at`: this is bookkeeping about a run
+ * that is no longer pending, not a change to the task.
+ */
+export function clearRunRequest(taskId: string): void {
+  clearMarkStmt.run(taskId);
+}
+
+/** A run the cap deferred, as the table records it. */
+export interface DeferredTaskRun {
+  id: string;
+  sourceType: string | null;
+  mode: RunRequestMode | null;
 }
 
 /**
- * The waiting line, in submission order.
+ * Every deferred run, oldest submission first.
  *
- * In memory rather than in the table, and that is the load-bearing decision:
- * `queued` is a resting state here — a task a person created and has not run
- * yet sits in it indefinitely — so a drain that walked every queued row would
- * launch runs nobody asked for. Only a run that was actually submitted and
- * deferred by the cap is in this list.
- *
- * The cost is that a restart empties the line. That leaves those rows `queued`,
- * which is exactly where they would have been had the process died a moment
- * earlier, and a person can run them again. Nothing is marked failed.
+ * `rowid` breaks a tie, so two submissions in the same millisecond keep insert
+ * order rather than an arbitrary one.
  */
-const waiting: Waiter[] = [];
+export function listDeferredTaskRuns(): DeferredTaskRun[] {
+  return listDeferredStmt.all() as DeferredTaskRun[];
+}
+
+/** How many runs the table says are waiting for a slot. */
+export function countDeferredTaskRuns(): number {
+  const row = countDeferredStmt.get() as { n: number } | undefined;
+  return row?.n ?? 0;
+}
+
+/**
+ * The in-process half of the waiting line: the promise each deferred run's
+ * dispatcher is parked on.
+ *
+ * The *order* is the table's, not this map's — see `drainTaskQueue`. This only
+ * answers "is a dispatcher in this process waiting for that row", which is the
+ * one thing the table cannot say and the one thing a restart destroys.
+ */
+const waiting = new Map<string, (claimed: boolean) => void>();
 let drainTimer: ReturnType<typeof setInterval> | null = null;
 let draining = false;
 
 function syncDrainTimer(): void {
-  if (waiting.length > 0 && drainTimer === null) {
+  if (waiting.size > 0 && drainTimer === null) {
     drainTimer = setInterval(() => {
       drainTaskQueue();
     }, DRAIN_INTERVAL_MS);
     drainTimer.unref?.();
     return;
   }
-  if (waiting.length === 0 && drainTimer !== null) {
+  if (waiting.size === 0 && drainTimer !== null) {
     clearInterval(drainTimer);
     drainTimer = null;
   }
@@ -208,27 +284,44 @@ function syncDrainTimer(): void {
 /**
  * Start as many waiting runs as the cap allows, oldest submission first.
  *
+ * The order comes from `run_requested_at` in the table rather than from the
+ * order dispatchers happened to arrive in this process. That is what makes a
+ * boot-recovered run keep its place: recovery re-dispatches it, its marker
+ * still holds the instant it was first submitted, and it sorts ahead of
+ * anything submitted since even though its dispatcher arrived last.
+ *
  * Strictly head-of-line: when the head cannot claim because the cap is full we
  * stop rather than letting a later arrival overtake it. That is what FIFO
  * means, and it is what keeps a workflow's first branch from being starved by
  * its own later ones.
+ *
+ * A deferred row with no waiter in this process is skipped rather than stopping
+ * the line. It is a row recovery has re-dispatched whose dispatcher has not
+ * reached `acquireTaskSlot` yet; blocking on it would stall every other run for
+ * as long as that takes, and in the worst case forever.
  */
 export function drainTaskQueue(): void {
-  if (draining) return;
+  // Nothing in this process is waiting, so there is nothing to resolve and no
+  // reason to read the table. Boot recovery owns deferred rows with no waiter.
+  if (waiting.size === 0 || draining) return;
   draining = true;
   try {
-    while (waiting.length > 0) {
-      const head = waiting[0];
-      const status = readTaskStatus(head.taskId);
-      if (status !== "queued") {
-        // Deleted, cancelled, or started by another path while it waited.
-        waiting.shift();
-        head.resolve(false);
-        continue;
-      }
-      if (!claimTaskSlot(head.taskId, { from: ["queued"] })) break;
-      waiting.shift();
-      head.resolve(true);
+    const deferred = listDeferredTaskRuns();
+    const deferredIds = new Set(deferred.map((row) => row.id));
+
+    // Deleted, cancelled, or started by another path while it waited.
+    for (const [taskId, resolve] of [...waiting]) {
+      if (deferredIds.has(taskId)) continue;
+      waiting.delete(taskId);
+      resolve(false);
+    }
+
+    for (const { id } of deferred) {
+      const resolve = waiting.get(id);
+      if (!resolve) continue;
+      if (!claimTaskSlot(id, { from: ["queued"] })) break;
+      waiting.delete(id);
+      resolve(true);
     }
   } finally {
     draining = false;
@@ -247,14 +340,18 @@ export function releaseTaskSlot(): void {
   drainTaskQueue();
 }
 
-/** How many runs are waiting for a slot. For tests and telemetry. */
+/** How many runs this process is holding for a slot. For tests and telemetry. */
 export function countWaitingTaskSlots(): number {
-  return waiting.length;
+  return waiting.size;
 }
 
 function enqueueForTaskSlot(taskId: string): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
-    waiting.push({ taskId, resolve });
+    const previous = waiting.get(taskId);
+    waiting.set(taskId, resolve);
+    // Two dispatchers for one row is a bug upstream, but dropping the first
+    // one's promise would hang it forever. Settle it as abandoned instead.
+    previous?.(false);
     syncDrainTimer();
     // A slot may have freed between the failed claim and this push.
     drainTaskQueue();
@@ -267,9 +364,13 @@ function enqueueForTaskSlot(taskId: string): Promise<boolean> {
  * Returns "claimed" when the row is `running` and counted, "abandoned" when
  * there is nothing left to run (the row was deleted, cancelled, or finished
  * while it waited). Never throws and never fails a run because the cap is full.
+ *
+ * @param mode — which entry point is asking, recorded on the row so boot
+ *   recovery re-dispatches a deferred resume as a resume.
  */
 export async function acquireTaskSlot(
   taskId: string,
+  mode: RunRequestMode = "start",
 ): Promise<"claimed" | "abandoned"> {
   if (claimTaskSlot(taskId)) return "claimed";
 
@@ -282,16 +383,18 @@ export async function acquireTaskSlot(
     return "abandoned";
   }
 
-  // The cap is full. Park the run as `queued` so what it is waiting for is
-  // visible, then take a place in line.
-  if (status !== "queued") {
-    parkStmt.run(Math.ceil(Date.now() / 1000), taskId, status);
-  }
+  // The cap is full. Park the run as `queued` and mark it as submitted, so
+  // what it is waiting for survives this process, then take a place in line.
+  const nowMs = Date.now();
+  markStmt.run(nowMs, mode, Math.ceil(nowMs / 1000), taskId, status);
   return (await enqueueForTaskSlot(taskId)) ? "claimed" : "abandoned";
 }
 
 const SWEEP_RESULT =
   "Relay restarted while this run was in flight. The attempt was stopped and was not replayed automatically.";
+
+const DEFERRED_WORKFLOW_RESULT =
+  "Relay restarted while this workflow step was waiting for a run slot. The workflow run stopped with the process, so the step was not replayed.";
 
 /**
  * Mark on-demand runs a previous process left `running` as failed.
@@ -313,10 +416,49 @@ export function sweepOrphanedTaskRuns(): string[] {
   return rows.map((row) => row.id);
 }
 
-/** Test seam: drop the waiting line and stop the drain timer. */
+/**
+ * Fail every deferred **workflow step**, with `failure_reason =
+ * 'process_restart'`.
+ *
+ * Boot recovery re-dispatches the other deferred runs, but not these: a step's
+ * workflow engine is driven by `executeWorkflow` in the process that died, and
+ * nothing at boot resurrects a workflow run. Re-dispatching the step would run
+ * an agent whose result nobody reads, and leaving it `queued` would hide a
+ * workflow that is never going to finish. Failing it is the one answer that is
+ * both visible and true.
+ *
+ * @returns the ids it failed.
+ */
+export function failDeferredWorkflowRuns(): string[] {
+  const nowSec = Math.ceil(Date.now() / 1000);
+  const rows = failDeferredWorkflowStmt.all(
+    DEFERRED_WORKFLOW_RESULT,
+    nowSec,
+  ) as Array<{ id: string }>;
+  return rows.map((row) => row.id);
+}
+
+/**
+ * Drop markers left on rows that are not deferred runs.
+ *
+ * A marker only means anything on a `queued` on-demand row. One anywhere else
+ * is the residue of a path that moved a row out of the line without clearing
+ * it; left alone it would come back to life the moment anything put that row
+ * back to `queued`. Run at boot, where it is cheap and where no dispatcher is
+ * mid-flight.
+ *
+ * @returns the ids it cleared.
+ */
+export function clearStaleRunRequests(): string[] {
+  const rows = clearStaleMarksStmt.all() as Array<{ id: string }>;
+  return rows.map((row) => row.id);
+}
+
+/** Test seam: drop the in-process waiting line and stop the drain timer. */
 export function __resetTaskSlotsForTests(): void {
-  while (waiting.length > 0) {
-    waiting.shift()?.resolve(false);
+  for (const [taskId, resolve] of [...waiting]) {
+    waiting.delete(taskId);
+    resolve(false);
   }
   syncDrainTimer();
 }

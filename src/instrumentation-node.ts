@@ -100,6 +100,42 @@ export async function registerNodeInstrumentation() {
       console.error("[plugins] loader failed:", err);
     }
 
+    // On-demand runs a previous process accepted and had not started yet: the
+    // caller holds a 202 `queued`, the row carries `run_requested_at`, and the
+    // promise its dispatcher waited on died with the process. Re-dispatched in
+    // submission order, except workflow steps, which are failed because their
+    // workflow engine is gone. See @/lib/agents/deferred-run-recovery.
+    //
+    // ORDERING INVARIANTS (do not move this block without re-checking):
+    //   - MUST come AFTER the orphan sweep above, so the slots those ghosts
+    //     held are free and the cap is counted against reality.
+    //   - MUST come AFTER the plugin loader — a recovered run may be bound to
+    //     a plugin profile, and dispatching before the registry is populated
+    //     fails it with "profile not found".
+    try {
+      const { recoverDeferredTaskRuns } = await import(
+        "@/lib/agents/deferred-run-recovery"
+      );
+      const recovery = await recoverDeferredTaskRuns();
+      if (recovery.failed.length > 0) {
+        console.warn(
+          `[task-slots] failed ${recovery.failed.length} deferred workflow step(s) a previous process left waiting: ${recovery.failed.join(", ")}`,
+        );
+      }
+      if (recovery.cleared.length > 0) {
+        console.warn(
+          `[task-slots] cleared a stale run request on ${recovery.cleared.length} row(s): ${recovery.cleared.join(", ")}`,
+        );
+      }
+      if (recovery.redispatched.length > 0) {
+        console.warn(
+          `[task-slots] re-dispatched ${recovery.redispatched.length} deferred on-demand run(s), oldest first: ${recovery.redispatched.join(", ")}`,
+        );
+      }
+    } catch (err) {
+      console.error("[task-slots] deferred run recovery failed:", err);
+    }
+
     // Instance upgrade poller — hourly `git fetch` to detect upstream commits.
     // Skipped in dev mode; lightweight; uses advisory lock to prevent overlap.
     const { startUpgradePoller } = await import("@/lib/instance/upgrade-poller");

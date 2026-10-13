@@ -237,7 +237,7 @@ export async function startTaskExecution(
   // On-demand runs pass the concurrency gate here; schedule firings claimed
   // their own slot before they got this far and are counted separately.
   const capped = isOnDemandSourceType(task.sourceType);
-  if (capped && (await acquireTaskSlot(taskId)) === "abandoned") return;
+  if (capped && (await acquireTaskSlot(taskId, "start")) === "abandoned") return;
 
   try {
     await db
@@ -286,7 +286,7 @@ export async function resumeTaskExecution(
   });
 
   const capped = isOnDemandSourceType(task.sourceType);
-  if (capped && (await acquireTaskSlot(taskId)) === "abandoned") return;
+  if (capped && (await acquireTaskSlot(taskId, "resume")) === "abandoned") return;
 
   try {
     await db
